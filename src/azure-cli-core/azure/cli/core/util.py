@@ -12,17 +12,13 @@ import base64
 import binascii
 import platform
 import ssl
-import six
 import re
 import logging
 
+import six
 from six.moves.urllib.request import urlopen  # pylint: disable=import-error
-
-from azure.common import AzureException
-from azure.core.exceptions import AzureError
 from knack.log import get_logger
 from knack.util import CLIError, to_snake_case
-from inspect import getfullargspec as get_arg_spec
 
 logger = get_logger(__name__)
 
@@ -54,6 +50,15 @@ _GENERAL_UPGRADE_INSTRUCTION = 'Instructions can be found at https://aka.ms/doc/
 _VERSION_CHECK_TIME = 'check_time'
 _VERSION_UPDATE_TIME = 'update_time'
 
+# A list of reserved names that cannot be used as admin username of VM
+DISALLOWED_USER_NAMES = [
+    "administrator", "admin", "user", "user1", "test", "user2",
+    "test1", "user3", "admin1", "1", "123", "a", "actuser", "adm",
+    "admin2", "aspnet", "backup", "console", "guest",
+    "owner", "root", "server", "sql", "support", "support_388945a0",
+    "sys", "test2", "test3", "user4", "user5"
+]
+
 
 def handle_exception(ex):  # pylint: disable=too-many-return-statements
     # For error code, follow guidelines at https://docs.python.org/2/library/sys.html#sys.exit,
@@ -61,6 +66,8 @@ def handle_exception(ex):  # pylint: disable=too-many-return-statements
     from msrestazure.azure_exceptions import CloudError
     from msrest.exceptions import HttpOperationError, ValidationError, ClientRequestError
     from azure.cli.core.azlogging import CommandLoggerContext
+    from azure.common import AzureException
+    from azure.core.exceptions import AzureError
 
     with CommandLoggerContext(logger):
         if isinstance(ex, JMESPathTypeError):
@@ -477,6 +484,7 @@ def is_track2(client_class):
     """ IS this client a autorestv3/track2 one?.
     Could be refined later if necessary.
     """
+    from inspect import getfullargspec as get_arg_spec
     args = get_arg_spec(client_class.__init__).args
     return "credential" in args
 
@@ -597,9 +605,13 @@ def reload_module(module):
 
 def get_default_admin_username():
     try:
-        return getpass.getuser()
+        username = getpass.getuser()
     except KeyError:
-        return None
+        username = None
+    if username is None or username.lower() in DISALLOWED_USER_NAMES:
+        logger.warning('Default username %s is a reserved username. Use azureuser instead.', username)
+        username = 'azureuser'
+    return username
 
 
 def _find_child(parent, *args, **kwargs):
@@ -726,34 +738,27 @@ def send_raw_request(cli_ctx, method, url, headers=None, uri_parameters=None,  #
             result[key] = value
     uri_parameters = result or None
 
+    endpoints = cli_ctx.cloud.endpoints
     # If url is an ARM resource ID, like /subscriptions/xxx/resourcegroups/xxx?api-version=2019-07-01,
     # default to Azure Resource Manager.
-    # https://management.azure.com/ + subscriptions/xxx/resourcegroups/xxx?api-version=2019-07-01
+    # https://management.azure.com + /subscriptions/xxx/resourcegroups/xxx?api-version=2019-07-01
     if '://' not in url:
-        url = cli_ctx.cloud.endpoints.resource_manager + url.lstrip('/')
+        url = endpoints.resource_manager.rstrip('/') + url
 
     # Replace common tokens with real values. It is for smooth experience if users copy and paste the url from
     # Azure Rest API doc
     from azure.cli.core._profile import Profile
-    profile = Profile()
+    profile = Profile(cli_ctx=cli_ctx)
     if '{subscriptionId}' in url:
         url = url.replace('{subscriptionId}', cli_ctx.data['subscription_id'] or profile.get_subscription_id())
 
-    token_subscription = None
-    _subscription_regexes = [re.compile('https://management.azure.com/subscriptions/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'),
-                             re.compile('https://graph.windows.net/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})')]
-    for regex in _subscription_regexes:
-        match = regex.match(url)
-        if match:
-            token_subscription = match.groups()[0]
-            logger.debug('Retrieve token from subscription %s', token_subscription)
-
+    # Prepare the Bearer token for `Authorization` header
     if not skip_authorization_header and url.lower().startswith('https://'):
+        # Prepare `resource` for `get_raw_token`
         if not resource:
-            endpoints = cli_ctx.cloud.endpoints
-            # If url starts with ARM endpoint, like https://management.azure.com/,
-            # use active_directory_resource_id for resource.
-            # This follows the same behavior as azure.cli.core.commands.client_factory._get_mgmt_service_client
+            # If url starts with ARM endpoint, like `https://management.azure.com/`,
+            # use `active_directory_resource_id` for resource, like `https://management.core.windows.net/`.
+            # This follows the same behavior as `azure.cli.core.commands.client_factory._get_mgmt_service_client`
             if url.lower().startswith(endpoints.resource_manager.rstrip('/')):
                 resource = endpoints.active_directory_resource_id
             else:
@@ -767,8 +772,20 @@ def send_raw_request(cli_ctx, method, url, headers=None, uri_parameters=None,  #
                         resource = value
                         break
         if resource:
-            token_info, _, _ = profile.get_raw_token(resource, subscription=token_subscription)
-            logger.debug('Retrievd AAD token for resource: %s', resource or 'ARM')
+            # Prepare `subscription` for `get_raw_token`
+            # If this is an ARM request, try to extract subscription ID from the URL.
+            # But there are APIs which don't require subscription ID, like /subscriptions, /tenants
+            # TODO: In the future when multi-tenant subscription is supported, we won't be able to uniquely identify
+            #   the token from subscription anymore.
+            token_subscription = None
+            if url.lower().startswith(endpoints.resource_manager.rstrip('/')):
+                token_subscription = _extract_subscription_id(url)
+            if token_subscription:
+                logger.debug('Retrieving token for resource %s, subscription %s', resource, token_subscription)
+                token_info, _, _ = profile.get_raw_token(resource, subscription=token_subscription)
+            else:
+                logger.debug('Retrieving token for resource %s', resource)
+                token_info, _, _ = profile.get_raw_token(resource)
             token_type, token, _ = token_info
             headers = headers or {}
             headers['Authorization'] = '{} {}'.format(token_type, token)
@@ -799,6 +816,18 @@ def send_raw_request(cli_ctx, method, url, headers=None, uri_parameters=None,  #
             for chunk in r.iter_content(chunk_size=128):
                 fd.write(chunk)
     return r
+
+
+def _extract_subscription_id(url):
+    """Extract the subscription ID from an ARM request URL."""
+    subscription_regex = '/subscriptions/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'
+    match = re.search(subscription_regex, url, re.IGNORECASE)
+    if match:
+        subscription_id = match.groups()[0]
+        logger.debug('Found subscription ID %s in the URL %s', subscription_id, url)
+        return subscription_id
+    logger.debug('No subscription ID specified in the URL %s', url)
+    return None
 
 
 def _log_request(request):
@@ -866,7 +895,7 @@ def _log_response(response, **kwargs):
         return response
 
 
-class ConfiguredDefaultSetter(object):
+class ScopedConfig:
 
     def __init__(self, cli_config, use_local_config=None):
         self.use_local_config = use_local_config
@@ -881,6 +910,9 @@ class ConfiguredDefaultSetter(object):
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         setattr(self.cli_config, 'use_local_config', self.original_use_local_config)
+
+
+ConfiguredDefaultSetter = ScopedConfig
 
 
 def _ssl_context():
@@ -982,3 +1014,25 @@ def get_linux_distro():
             release_info[k.lower()] = v.strip('"')
 
     return release_info.get('name', None), release_info.get('version_id', None)
+
+
+def roughly_parse_command(args):
+    # Roughly parse the command part: <az vm create> --name vm1
+    # Similar to knack.invocation.CommandInvoker._rudimentary_get_command, but we don't need to bother with
+    # positional args
+    nouns = []
+    for arg in args:
+        if arg and arg[0] != '-':
+            nouns.append(arg)
+        else:
+            break
+    return ' '.join(nouns).lower()
+
+
+def is_guid(guid):
+    import uuid
+    try:
+        uuid.UUID(guid)
+        return True
+    except ValueError:
+        return False
